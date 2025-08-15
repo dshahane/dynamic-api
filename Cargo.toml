@@ -1,0 +1,15 @@
+[package]
+name = "dynamic-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actix-web = { version = "4", features = ["macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+jsonschema = "0.17"
+uuid = { version = "1.8", features = ["v4", "fast-rng"] }
+# Using the latest compatible versions and correct features
+utoipa = { version = "5.1.0" }
+utoipa-swagger-ui = { version = "9.0.2", features = ["actix-web"] }
+
