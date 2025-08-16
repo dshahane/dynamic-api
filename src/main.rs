@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use jsonschema::JSONSchema;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex};
 use std::io;
 
 // Import utoipa and utoipa-swagger-ui-dist.
