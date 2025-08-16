@@ -6,7 +6,8 @@
 // a separate route to serve the OpenAPI specification.
 
 // Import necessary crates.
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{http, web, App, HttpResponse, HttpServer, Responder};
+use actix_cors::Cors;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use jsonschema::JSONSchema;
@@ -326,7 +327,14 @@ async fn main() -> io::Result<()> {
 
     HttpServer::new(move || {
         let swagger_ui_path = "./static/swagger-ui-dist";
+        let cors = Cors::default()
+            .allowed_origin("http://localhost:3000")
+            .allowed_methods(vec!["GET"])
+            .allowed_headers(vec![http::header::AUTHORIZATION, http::header::ACCEPT, http::header::CONTENT_TYPE])
+            .supports_credentials();
+
         App::new()
+            .wrap(cors)
             // Pass the application state to all route handlers.
             .app_data(app_state.clone())
             // Also pass the OpenAPI spec, which is now serializable.
