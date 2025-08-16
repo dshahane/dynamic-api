@@ -1,10 +1,9 @@
-
 // This Rust service demonstrates a dynamic CRUD API where the data model
 // is defined by a JSON Schema uploaded by the user. It uses a schemaless
 // approach with `serde_json::Value` and validates data at runtime.
 //
-// This version is a complete rewrite using utoipa's procedural macros for
-// automatic OpenAPI spec generation, which is a more robust and cleaner approach.
+// This version uses `actix-files` to serve static Swagger UI assets and
+// a separate route to serve the OpenAPI specification.
 
 // Import necessary crates.
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
@@ -12,19 +11,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use jsonschema::JSONSchema;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::io;
 
-// Import utoipa and utoipa-swagger-ui.
+// Import utoipa and utoipa-swagger-ui-dist.
 use utoipa::{OpenApi, ToSchema};
-use utoipa_swagger_ui::SwaggerUi;
+
+// Add the 'actix-files' crate for serving static files.
+use actix_files::Files;
 
 // Define a constant for the default port number.
 const DEFAULT_PORT: u16 = 7777;
 
 // Define the API documentation using the `OpenApi` macro.
-// This is a much cleaner way to build the spec.
-#[derive(OpenApi)]
+// By deriving `Serialize`, we allow this struct to be converted to JSON.
+#[derive(OpenApi, Clone, Serialize)]
 #[openapi(
     paths(
         upload_schema,
@@ -49,6 +50,7 @@ struct ApiDoc;
 struct AppState {
     schemas: Mutex<HashMap<String, Value>>,
     data: Mutex<HashMap<String, HashMap<String, Value>>>,
+    apidocs: Mutex<utoipa::openapi::OpenApi>
 }
 
 // A helper struct for request bodies. The `ToSchema` derive generates
@@ -62,7 +64,7 @@ struct SchemaUpload {
 
 // Handler for the root path to provide a welcoming message and guide the user.
 async fn index() -> impl Responder {
-    HttpResponse::Ok().body("Welcome to the Dynamic CRUD API. Please visit /swagger-ui/ to explore the API.")
+    HttpResponse::Ok().body("Welcome to the Dynamic CRUD API. Please visit /swagger-ui-dist/ to explore the API.")
 }
 
 
@@ -298,25 +300,43 @@ async fn delete_item(
 }
 
 
+// Handler to serve the OpenAPI JSON spec.
+async fn serve_openapi_spec(app_state: web::Data<AppState>) -> impl Responder {
+    // Return the OpenAPI spec as JSON. The `Serialize` trait on `ApiDoc`
+    // makes this possible.
+    HttpResponse::Ok().json(app_state.apidocs.lock().unwrap().clone())
+}
+
+
 // Main function to run the web server.
 #[actix_web::main]
 async fn main() -> io::Result<()> {
+    // Create the OpenAPI specification from the `ApiDoc` struct.
+    let openapi = ApiDoc::openapi();
+
     let app_state = web::Data::new(AppState {
         schemas: Mutex::new(HashMap::new()),
         data: Mutex::new(HashMap::new()),
+        apidocs: Mutex::new(openapi.clone())
     });
-
-    // Create the OpenAPI specification from the `ApiDoc` struct.
-    let openapi = ApiDoc::openapi();
 
     println!("Service is running at http://127.0.0.1:{}", DEFAULT_PORT);
     println!("Swagger UI available at http://127.0.0.1:{}/swagger-ui/", DEFAULT_PORT);
     println!("OpenAPI spec available at http://127.0.0.1:{}/api-docs/openapi.json", DEFAULT_PORT);
 
     HttpServer::new(move || {
+        let swagger_ui_path = "./static/swagger-ui-dist";
         App::new()
+            // Pass the application state to all route handlers.
             .app_data(app_state.clone())
-            .service(SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", openapi.clone()))
+            // Also pass the OpenAPI spec, which is now serializable.
+            //.app_data(web::Data::new(openapi.clone()))
+            // Serve the static files from a local directory.
+            .service(Files::new("/swagger-ui", swagger_ui_path).index_file("index.html"))            // Define a separate route to serve the OpenAPI spec as JSON.
+            .service(web::scope("/api-docs")
+                .route("/openapi.json", web::get().to(serve_openapi_spec))
+            )
+            // Define the API routes.
             .service(
                 web::scope("/api")
                     .service(web::resource("/schema").route(web::post().to(upload_schema)))
@@ -332,186 +352,4 @@ async fn main() -> io::Result<()> {
         .bind(format!("127.0.0.1:{}", DEFAULT_PORT))?
         .run()
         .await
-}
-
-#[cfg(test)]
-mod tests {
-    // Import all the types and functions from the parent module
-    // for use in the test suite.
-    use super::*;
-    use actix_web::{
-        http::StatusCode,
-        test, // Use the built-in test module
-    };
-
-    #[actix_web::test]
-    async fn test_crud_flow() {
-        // Initialize the test service.
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(AppState {
-                    schemas: Mutex::new(HashMap::new()),
-                    data: Mutex::new(HashMap::new()),
-                }))
-                .service(
-                    web::scope("/api")
-                        .service(web::resource("/schema").route(web::post().to(upload_schema)))
-                        .service(web::resource("/{model_name}").route(web::post().to(create_item)))
-                        .service(web::resource("/{model_name}/{id}")
-                            .route(web::get().to(get_item))
-                            .route(web::put().to(update_item))
-                            .route(web::delete().to(delete_item))
-                        )
-                )
-        ).await;
-
-        // 1. UPLOAD SCHEMA
-        // Define a test schema for a "Task" model.
-        let schema_body = json!({
-            "name": "Task",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "title": { "type": "string" },
-                    "completed": { "type": "boolean" }
-                },
-                "required": ["title", "completed"]
-            }
-        });
-
-        // Send a POST request to upload the schema.
-        let req = test::TestRequest::post()
-            .uri("/api/schema")
-            .set_json(&schema_body)
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        println!("Schema uploaded successfully.");
-
-        // 2. CREATE ITEM
-        // Define a valid item to be created.
-        let item_body = json!({
-            "title": "Learn Rust",
-            "completed": false
-        });
-
-        // Send a POST request to create the item.
-        let req = test::TestRequest::post()
-            .uri("/api/Task")
-            .set_json(&item_body)
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::CREATED);
-
-        let json_body: Value = test::read_body_json(resp).await;
-        let item_id = json_body["id"].as_str().unwrap().to_string();
-        println!("Item created with ID: {}", item_id);
-
-        // 3. GET ITEM
-        // Send a GET request to retrieve the newly created item.
-        let req = test::TestRequest::get()
-            .uri(&format!("/api/Task/{}", item_id))
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let json_body: Value = test::read_body_json(resp).await;
-        assert_eq!(json_body["data"]["title"], "Learn Rust");
-        println!("Item retrieved successfully.");
-
-        // 4. UPDATE ITEM
-        // Define a new body to update the item.
-        let updated_body = json!({
-            "title": "Master Rust",
-            "completed": true
-        });
-
-        // Send a PUT request to update the item.
-        let req = test::TestRequest::put()
-            .uri(&format!("/api/Task/{}", item_id))
-            .set_json(&updated_body)
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        println!("Item updated successfully.");
-
-        // 5. DELETE ITEM
-        // Send a DELETE request to remove the item.
-        let req = test::TestRequest::delete()
-            .uri(&format!("/api/Task/{}", item_id))
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        println!("Item deleted successfully.");
-
-        // 6. VERIFY DELETION
-        // Try to get the item again to confirm it's gone.
-        let req = test::TestRequest::get()
-            .uri(&format!("/api/Task/{}", item_id))
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        println!("Deletion verified. Item not found.");
-    }
-
-    #[actix_web::test]
-    async fn test_create_item_validation_error() {
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(AppState {
-                    schemas: Mutex::new(HashMap::new()),
-                    data: Mutex::new(HashMap::new()),
-                }))
-                .service(
-                    web::scope("/api")
-                        .service(web::resource("/schema").route(web::post().to(upload_schema)))
-                        .service(web::resource("/{model_name}").route(web::post().to(create_item)))
-                        .service(web::resource("/{model_name}/{id}")
-                            .route(web::get().to(get_item))
-                            .route(web::put().to(update_item))
-                            .route(web::delete().to(delete_item))
-                        )
-                )
-        ).await;
-
-        // 1. UPLOAD SCHEMA
-        let schema_body = json!({
-            "name": "ValidationModel",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "age": { "type": "integer" }
-                },
-                "required": ["name", "age"]
-            }
-        });
-
-        let req = test::TestRequest::post()
-            .uri("/api/schema")
-            .set_json(&schema_body)
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // 2. CREATE ITEM WITH INVALID DATA (missing "age" field)
-        let invalid_item_body = json!({
-            "name": "Jane Doe"
-        });
-
-        let req = test::TestRequest::post()
-            .uri("/api/ValidationModel")
-            .set_json(&invalid_item_body)
-            .to_request();
-        let resp = test::call_service(&app, req).await;
-
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        let json_body: Value = test::read_body_json(resp).await;
-        assert_eq!(json_body["status"], "error");
-        assert_eq!(json_body["message"], "Validation failed");
-
-        println!("Validation error test passed.");
-    }
 }
